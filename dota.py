@@ -13,7 +13,7 @@ try:
 except Exception:
     pass
 
-# ===== Cross-platform temp dir =====
+# Cross-platform temp directory
 _CUSTOM_TEMP = os.path.join(tempfile.gettempdir(), "ptemp")
 try:
     os.makedirs(_CUSTOM_TEMP, exist_ok=True)
@@ -31,12 +31,13 @@ import importlib
 
 
 def ensure(pkg, import_name=None):
-    import_name = import_name or pkg
+    name = import_name or pkg
     try:
-        importlib.import_module(import_name)
+        importlib.import_module(name)
     except ImportError:
         print(f"📦 Installing {pkg}...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+
 
 ensure("playwright")
 ensure("playwright-stealth", "playwright_stealth")
@@ -56,47 +57,51 @@ except ImportError:
 
 
 def detect_os():
-    """Return friendly OS name for logging."""
-    s = platform.system()
-    if s == "Windows":
-        return "Windows"
-    if s == "Darwin":
-        return "macOS"
-    if s == "Linux":
-        return "Linux"
-    return s or "Unknown"
+    return platform.system() or "Unknown"
 
 
-def ensure_browsers():
-    """Install all 3 browsers. At least one will work on ANY OS:
-    - msedge: Windows, macOS, Ubuntu/Debian Linux
-    - chrome: Windows, macOS, most Linux distros
-    - chromium: ALL OS (guaranteed fallback)
-    """
-    print(f"🌐 OS: {detect_os()} — installing browsers...")
-    installed = []
-    for name in ("msedge", "chrome", "chromium"):
+def is_linux():
+    return sys.platform.startswith("linux")
+
+
+def ensure_msedge():
+    """Install msedge binary + OS dependencies (Linux-only for install-deps)."""
+    print(f"🌐 OS: {detect_os()} — ensuring Edge is installed...")
+
+    # 1. OS-level dependencies (Linux only — Windows/macOS don't need this)
+    if is_linux():
         try:
-            print(f"   → installing {name}...")
+            print("   → installing system dependencies...")
             r = subprocess.run(
-                [sys.executable, "-m", "playwright", "install", name],
+                [sys.executable, "-m", "playwright", "install-deps", "msedge"],
                 capture_output=True, text=True, timeout=900,
+                encoding="utf-8", errors="ignore",
             )
             if r.returncode == 0:
-                print(f"   ✅ {name} ready")
-                installed.append(name)
+                print("   ✅ OS dependencies ready")
             else:
-                print(f"   ⚠️ {name} unavailable (exit {r.returncode})")
-                if name == "msedge" and sys.platform.startswith("linux"):
-                    print(f"      ℹ️ msedge only installs on Ubuntu/Debian — will fall back")
+                print(f"   ⚠️ install-deps exit {r.returncode}")
+                if r.stderr:
+                    print(f"   {r.stderr[:300]}")
         except Exception as e:
-            print(f"   ⚠️ {name}: {type(e).__name__}: {e}")
+            print(f"   ⚠️ install-deps: {type(e).__name__}: {e}")
 
-    if not installed:
-        print("❌ No browser installed. Try manually:")
-        print(f"   {sys.executable} -m playwright install chromium")
-    else:
-        print(f"✅ Browsers available: {', '.join(installed)}")
+    # 2. msedge binary (all OS)
+    try:
+        print("   → installing msedge binary...")
+        r = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "msedge"],
+            capture_output=True, text=True, timeout=900,
+            encoding="utf-8", errors="ignore",
+        )
+        if r.returncode == 0:
+            print("   ✅ msedge ready")
+        else:
+            print(f"   ⚠️ msedge install exit {r.returncode}")
+            if r.stderr:
+                print(f"   {r.stderr[:300]}")
+    except Exception as e:
+        print(f"   ⚠️ msedge install: {type(e).__name__}: {e}")
 
 
 def boost_python_process():
@@ -109,7 +114,7 @@ def boost_python_process():
                 p.nice(-10)
             except Exception:
                 p.nice(10)
-        print(f"⚡ Python priority: HIGH")
+        print("⚡ Python priority: HIGH")
     except Exception as e:
         print(f"⚠️ priority: {e}")
 
@@ -130,16 +135,10 @@ INPUT_REFRESH_EVERY = 20
 REDIRECT_CHECK_EVERY = 50
 REDIRECT_WATCH_INTERVAL = 60
 
-# Dynamic UA — set per launched channel in launch_browser()
-UA_EDGE = (
+USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
-)
-UA_CHROME = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
 )
 
 EMOJI_LIST_1 = ["🧊", "❄️", "💠", "🍀", "🪷️", "🪼", "🦠", "🧃", "🍷", "🥂"]
@@ -171,17 +170,16 @@ NOTIF_ALLOW_SELECTORS = [
     'button:has-text("Anumati")',
 ]
 
-# ===== YOUR UPDATED ELEMENTS (KEPT AS-IS) =====
 GC_INFO_BTN   = '.x1i10hfl:nth-child(3) circle:nth-child(3)'
 GC_CHANGE_BTN = 'div.xwhw2v2'
 GC_NAME_INPUT = 'input.x11f1dot'
 GC_SAVE_BTN   = 'div.xqui205:nth-child(3)'
-# ==============================================
 
 SEL_SEND_BTN  = '.x9bdzbf > path'
 
 PAGE_LOCK = None
 LOGGED_OUT = False
+BROWSER_LABEL = "msedge"
 
 
 # ================= INIT SCRIPTS =================
@@ -378,7 +376,6 @@ stats = {
 PREFIX = DEFAULT_PREFIX
 TARGET_URL = "?"
 NEW_GC_NAME = ""
-BROWSER_LABEL = "?"
 
 
 def ts():
@@ -434,43 +431,83 @@ async def find_input(page, timeout_ms=10000):
     return None
 
 
+async def dump_page_debug(page, label="input_not_found"):
+    """Save diagnostics when input isn't found — helps us see what page we're on."""
+    print(f"\n🐛 DEBUG ({label}):")
+    try:
+        url = page.url
+    except Exception:
+        url = "?"
+    print(f"   URL   : {url}")
+
+    try:
+        title = await page.title()
+    except Exception:
+        title = "?"
+    print(f"   Title : {title}")
+
+    try:
+        body_text = await page.evaluate(
+            "() => document.body ? document.body.innerText.substring(0, 300) : 'no body'"
+        )
+        body_text = str(body_text).replace("\n", " ")[:300]
+        print(f"   Body  : {body_text}")
+    except Exception as e:
+        print(f"   Body  : <eval failed: {type(e).__name__}>")
+
+    try:
+        fname = f"./debug_{label}_{int(time.time())}.png"
+        await page.screenshot(path=fname, full_page=False)
+        print(f"   Screenshot saved: {fname}")
+    except Exception as e:
+        print(f"   Screenshot failed: {type(e).__name__}: {e}")
+
+    print()
+
+
 # ================= PROMPT =================
 async def prompt_async(text):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, input, text)
 
 
-# ================= CHROMIUM ARGS =================
-CHROMIUM_ARGS = [
-    "--start-maximized",
-    "--disable-blink-features=AutomationControlled",
-    "--no-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-background-timer-throttling",
-    "--disable-backgrounding-occluded-windows",
-    "--disable-renderer-backgrounding",
-    "--disable-gpu",
-    "--disable-software-rasterizer",
-    "--mute-audio",
-    "--disable-extensions",
-    "--disable-default-apps",
-    "--disable-sync",
-    "--disable-background-networking",
-    "--disable-component-update",
-    "--disable-domain-reliability",
-    "--disable-client-side-phishing-detection",
-    "--disable-hang-monitor",
-    "--disable-popup-blocking",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--disable-logging",
-    "--log-level=3",
-    "--metrics-recording-only",
-    "--enable-features=NetworkService",
-    "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints,CalculateNativeWinOcclusion",
-    "--disk-cache-size=1",
-    "--disable-application-cache",
-]
+# ================= CHROMIUM ARGS (platform-aware) =================
+def get_chromium_args():
+    """Platform-aware browser args. Removes --single-process on Windows/macOS
+    (it breaks SPA rendering), keeps sandbox workarounds on Linux only."""
+    args = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--mute-audio",
+        "--disable-extensions",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-domain-reliability",
+        "--disable-client-side-phishing-detection",
+        "--disable-hang-monitor",
+        "--disable-popup-blocking",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-logging",
+        "--log-level=3",
+        "--metrics-recording-only",
+        "--enable-features=NetworkService",
+        "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints,CalculateNativeWinOcclusion",
+        "--disk-cache-size=1",
+        "--disable-application-cache",
+    ]
+    if is_linux():
+        # Linux CI containers sometimes need this
+        args.insert(0, "--disable-setuid-sandbox")
+    return args
 
 
 async def attach_scripts(page):
@@ -484,71 +521,21 @@ async def attach_scripts(page):
         pass
 
 
-# ================= LAUNCH — fallback chain =================
+# ================= LAUNCH =================
 async def launch_browser(pw, session_id):
-    """
-    Try in order: msedge → chrome → bundled Chromium.
-    Returns (browser, context, channel_label).
-    Raises RuntimeError if all fail.
-    """
-    candidates = [
-        ("msedge",    UA_EDGE),
-        ("chrome",    UA_CHROME),
-        (None,        UA_CHROME),   # None = bundled Chromium
-    ]
+    browser = await pw.chromium.launch(
+        channel="msedge",
+        headless=True,
+        args=get_chromium_args(),
+    )
+    context = await browser.new_context(
+        user_agent=USER_AGENT,
+        viewport={"width": 1440, "height": 900},
+        locale="en-US",
+        timezone_id="Asia/Kolkata",
+        reduced_motion="reduce",
+    )
 
-    browser = None
-    context = None
-    chosen_label = None
-    chosen_ua = UA_CHROME
-    last_err = None
-
-    for channel, ua in candidates:
-        label = channel or "bundled-chromium"
-        try:
-            print(f"🔎 Trying browser: {label}...")
-            kwargs = {
-                "headless": False,
-                "args": CHROMIUM_ARGS,
-            }
-            if channel:
-                kwargs["channel"] = channel
-
-            browser = await pw.chromium.launch(**kwargs)
-            chosen_label = label
-            chosen_ua = ua
-            print(f"✅ Launched: {label}")
-            break
-        except Exception as e:
-            last_err = e
-            print(f"⚠️ {label} failed: {type(e).__name__}: {str(e)[:120]}")
-            browser = None
-            continue
-
-    if browser is None:
-        raise RuntimeError(
-            f"All browsers failed. Last error: {last_err}. "
-            f"Run: {sys.executable} -m playwright install chromium"
-        )
-
-    # Create context with matching UA
-    try:
-        context = await browser.new_context(
-            user_agent=chosen_ua,
-            locale="en-US",
-            timezone_id="Asia/Kolkata",
-            reduced_motion="reduce",
-            no_viewport=True,
-        )
-    except TypeError:
-        context = await browser.new_context(
-            user_agent=chosen_ua,
-            locale="en-US",
-            timezone_id="Asia/Kolkata",
-            reduced_motion="reduce",
-        )
-
-    # Inject session cookie
     try:
         await context.add_cookies([{
             "name": "sessionid",
@@ -577,10 +564,9 @@ async def launch_browser(pw, session_id):
     except Exception:
         pass
 
-    return browser, context, chosen_label
+    return browser, context
 
 
-# ================= CLEANUP =================
 async def _cleanup_browser(browser, context):
     if context:
         try: await context.close()
@@ -741,7 +727,7 @@ async def gc_monitor(page):
 
             if "/accounts/login" in cur:
                 LOGGED_OUT = True
-                print(f"\n🚨 MONITOR: Logged out (login page).")
+                print("\n🚨 MONITOR: Logged out (login page).")
                 return
 
             if "direct/t/" in cur:
@@ -922,7 +908,7 @@ async def dashboard():
         status_tag = "LOGGED OUT ⚠️" if LOGGED_OUT else "LIVE"
         lines.append(f"  SINGLE GC SENDER  —  {status_tag}".ljust(W))
         lines.append("═" * W)
-        lines.append(f"  Browser        : {BROWSER_LABEL}")
+        lines.append(f"  Browser        : {BROWSER_LABEL} (headless)")
         lines.append(f"  OS             : {detect_os()}")
         lines.append(f"  GC Name        : {NEW_GC_NAME[:40] if NEW_GC_NAME else '(skip)'}")
         lines.append(f"  Prefix         : {PREFIX[:40]}")
@@ -994,29 +980,28 @@ async def browser_health_monitor(browser, page, restart_flag):
 
 # ================= MAIN =================
 async def main():
-    global PREFIX, TARGET_URL, NEW_GC_NAME, PAGE_LOCK, BROWSER_LABEL
+    global PREFIX, TARGET_URL, NEW_GC_NAME, PAGE_LOCK
 
-    # ---- Validate hardcoded values (fail fast) ----
     if not HARDCODED_SESSION_ID:
-        print("❌ HARDCODED_SESSION_ID is empty. Edit the file.")
+        print("❌ HARDCODED_SESSION_ID is empty.")
         sys.exit(1)
     if not HARDCODED_PREFIX:
-        print("❌ HARDCODED_PREFIX is empty. Edit the file.")
+        print("❌ HARDCODED_PREFIX is empty.")
         sys.exit(1)
     if not HARDCODED_GC_LINK or "direct/t/" not in HARDCODED_GC_LINK:
-        print("❌ HARDCODED_GC_LINK is empty or invalid (must contain \"direct/t/\").")
+        print("❌ HARDCODED_GC_LINK invalid (must contain direct/t/).")
         sys.exit(1)
 
     PAGE_LOCK = asyncio.Lock()
 
     boost_python_process()
-    ensure_browsers()
+    ensure_msedge()
 
     PREFIX = HARDCODED_PREFIX
     NEW_GC_NAME = HARDCODED_GC_NAME
     TARGET_URL = HARDCODED_GC_LINK
 
-    print("🚀 IG DM Sender — cross-platform (Edge → Chrome → Chromium fallback)")
+    print("🚀 IG DM Sender — Edge headless only")
     print(f"🖥️  OS: {detect_os()}")
     print(f"📌 GC Name: {NEW_GC_NAME or '(skip)'}")
     print(f"🏷️  Prefix : {PREFIX}")
@@ -1035,11 +1020,12 @@ async def main():
     try:
         while not restart_flag.is_set():
             try:
-                browser, context, BROWSER_LABEL = await launch_browser(pw, HARDCODED_SESSION_ID)
+                browser, context = await launch_browser(pw, HARDCODED_SESSION_ID)
                 page = context.pages[0] if context.pages else await context.new_page()
                 await attach_scripts(page)
             except Exception as e:
                 print(f"❌ Launch: {type(e).__name__}: {e}")
+                print("   Try: python -m playwright install-deps msedge && python -m playwright install msedge")
                 await asyncio.sleep(60)
                 continue
 
@@ -1058,24 +1044,36 @@ async def main():
 
             if "/accounts/login" in cur or "/challenge/" in cur:
                 print(f"❌ Session invalid — landed on {cur[:60]}")
-                print("   → Edit HARDCODED_SESSION_ID with a fresh sessionid.")
                 await _cleanup_browser(browser, context)
                 browser = context = None
                 break
 
-            print(f"✅ Session valid (browser: {BROWSER_LABEL})")
+            print("✅ Session valid")
 
-            # Navigate to GC
+            # Navigate to GC — allow SPA time to render
             try:
                 await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
+                # Networkidle is risky on Instagram DM (WebSocket keeps it busy) — timeout-wrapped
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
                 await page.wait_for_timeout(random.randint(3000, 5000))
                 await dismiss_notif_popup(page, max_rounds=3)
             except Exception:
                 pass
 
+            # Try to find input, with one retry
             input_el = await find_input(page, timeout_ms=15000)
             if not input_el:
-                print("❌ Input not found in GC")
+                print("⏳ Input not found (attempt 1), waiting 5s and retrying...")
+                await page.wait_for_timeout(5000)
+                await dismiss_notif_popup(page, max_rounds=2)
+                input_el = await find_input(page, timeout_ms=15000)
+
+            if not input_el:
+                await dump_page_debug(page, "input_not_found")
+                print("❌ Input not found in GC after 2 attempts")
                 await _cleanup_browser(browser, context)
                 browser = context = None
                 break
