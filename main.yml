@@ -1,0 +1,176 @@
+name: Bot Chain
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # 1. SETUP: Finds files and creates the runner groups
+  # ─────────────────────────────────────────────────────────────
+  setup:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      has_files: ${{ steps.set-matrix.outputs.has_files }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: set-matrix
+        run: |
+          FILES=( $(ls mainx*.py 2>/dev/null | sort -V) )
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "matrix=[]" >> $GITHUB_OUTPUT
+            echo "has_files=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "has_files=true" >> $GITHUB_OUTPUT
+          PAIRS=()
+          for ((i=0; i<${#FILES[@]}; i+=2)); do
+            if [ -n "${FILES[$((i+1))]}" ]; then
+              PAIRS+=("${FILES[$i]},${FILES[$((i+1))]}")
+            else
+              PAIRS+=("${FILES[$i]}")
+            fi
+          done
+
+          JSON_ARRAY=$(printf '%s\n' "${PAIRS[@]}" | jq -R . | jq -s -c .)
+          echo "matrix=$JSON_ARRAY" >> $GITHUB_OUTPUT
+
+  # ─────────────────────────────────────────────────────────────
+  # 2. RUN-BOTS: Spawns runners and monitors for file deletions
+  # ─────────────────────────────────────────────────────────────
+  run-bots:
+    needs: setup
+    if: needs.setup.outputs.has_files == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        files: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    concurrency:
+      group: bot-runner-${{ matrix.files }}
+      cancel-in-progress: true 
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: |
+          pip install playwright requests psutil python-telegram-bot igrapiweb
+          python -m playwright install --with-deps chromium
+      - name: Run Files with Deletion Monitor
+        env:
+          FILES: ${{ matrix.files }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+        run: |
+          # Lightweight trap: kills the script AND all python child processes instantly
+          trap 'kill 0' EXIT INT TERM
+          
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          
+          IFS=',' read -ra FILE_ARR <<< "$FILES"
+          echo "📦 Hosting: ${FILE_ARR[*]}"
+          
+          declare -A BOT_PIDS
+          for f in "${FILE_ARR[@]}"; do
+            ( while true; do python -u "$f" || true; sleep 5; done ) &
+            BOT_PIDS["$f"]=$!
+          done
+          
+          while true; do
+            sleep 60
+            # Sync with repo and clean up untracked files (prevents disk space crash)
+            git fetch origin main -q && git reset --hard origin/main -q && git clean -fdx -q
+            
+            for f in "${!BOT_PIDS[@]}"; do
+              if [ ! -f "$f" ]; then
+                echo "🗑️ $f deleted! Killing process..."
+                kill -9 "${BOT_PIDS[$f]}" 2>/dev/null || true
+                pkill -9 -f "python -u $f" 2>/dev/null || true
+                unset BOT_PIDS["$f"]
+              fi
+            done
+            
+            # If all files are deleted, exit gracefully
+            [ ${#BOT_PIDS[@]} -eq 0 ] && { echo "✅ All files deleted."; exit 0; }
+          done
+
+  # ─────────────────────────────────────────────────────────────
+  # 3. WATCHER: Monitors for new files and Safe Handoff
+  # ─────────────────────────────────────────────────────────────
+  watcher:
+    needs: setup
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    concurrency:
+      group: bot-watcher
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Watch Repo
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+
+          # Track hashes to detect additions OR file content edits
+          INITIAL_HASH=$(ls mainx*.py 2>/dev/null | sort -V | md5sum | awk '{print $1}')
+          RUN_SECONDS=$(shuf -i 18000-20700 -n 1)
+          START_TS=$(date +%s)
+
+          while true; do
+            sleep 60
+            git fetch origin main -q && git reset --hard origin/main -q
+            
+            CURRENT_HASH=$(ls mainx*.py 2>/dev/null | sort -V | md5sum | awk '{print $1}')
+            ELAPSED=$(( $(date +%s) - START_TS ))
+            
+            if [ "$CURRENT_HASH" != "$INITIAL_HASH" ] || [ "$ELAPSED" -ge "$RUN_SECONDS" ]; then
+              echo "🔄 Change detected or timer expired. Handing off..."
+              break
+            fi
+          done
+
+          # ─────────────────────────────────────────────────────────────
+          # SAFE HANDOFF using gh CLI (Race condition fixed)
+          # ─────────────────────────────────────────────────────────────
+          echo "Dispatching new run..."
+          gh workflow run main.yml --ref main
+
+          echo "⏳ Waiting for new run to register in API..."
+          NEW_RUN_ID=""
+          
+          # Loop for 100 seconds to safely find the new run
+          for i in {1..10}; do
+            sleep 10
+            # Find a run that is NOT the current one and is actively queueing/running
+            NEW_RUN_ID=$(gh run list --workflow main.yml --limit 10 --json databaseId,status --jq ".[] | select(.databaseId != ${RUN_ID}) | select(.status == \"queued\" or .status == \"in_progress\") | .databaseId" | head -n 1)
+            
+            if [ -n "$NEW_RUN_ID" ]; then
+              break
+            fi
+          done
+
+          if [ -z "$NEW_RUN_ID" ]; then
+            echo "❌ Failed to find new run in API after 100s. Aborting kill to save old run."
+            exit 1
+          fi
+
+          echo "✅ New run ($NEW_RUN_ID) registered. Waiting 60s health check..."
+          sleep 60
+          
+          STATUS=$(gh run view "$NEW_RUN_ID" --json status --jq '.status')
+
+          if [ "$STATUS" = "queued" ] || [ "$STATUS" = "in_progress" ]; then
+            echo "💀 New run healthy. Killing old run ($RUN_ID)..."
+            gh run cancel "$RUN_ID"
+            exit 0
+          else
+            echo "❌ New run died instantly. Old run preserved."
+            exit 1
+          fi
